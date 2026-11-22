@@ -1,345 +1,271 @@
-// EMBERFALL DUEL — the rules engine.
-// Pure state and transitions: no DOM, no timers. The renderer asks this module
-// what is legal, applies moves, and reads back events to animate. The AI uses
-// the same functions the player does, so both duelists obey one rulebook.
+// Rules engine: pure state, no DOM. Turns, ember, play, combat, win check.
+import { CONFIG } from './config.js';
+import { cardById } from './cards.js';
+import { buildDeck, drawFrom } from './deck.js';
+import { mulberry32 } from './random.js';
 
-import { DUEL } from './config.js';
-import { buildDeck, defOf, drawMany, drawOne } from './deck.js';
-import { needsTarget } from './cards.js';
+let uidCounter = 1;
 
-let minionSerial = 0;
-
-/** One duelist: hero, hand, board, deck and the counters the HUD shows. */
-export function makeDuelist(name, rng, owner) {
+export function makeMinion(cardId, owner) {
+  const card = cardById(cardId);
   return {
-    name,
+    uid: uidCounter++,
+    cardId,
     owner,
-    health: DUEL.heroHealth,
-    maxHealth: DUEL.heroHealth,
-    ember: 0,
-    emberMax: 0,
-    deck: buildDeck(rng, owner),
-    hand: [],
-    board: [],
-    burnTurns: 0, // remaining Slow Burn ticks waiting on this hero
-    burnAmount: 0,
-    fatigue: 0,
-    damageDealt: 0, // lifetime score the end screens report
-    cardsPlayed: 0,
+    attack: card.attack,
+    health: card.health,
+    maxHealth: card.health,
+    keywords: card.keywords.slice(),
+    canAttack: card.keywords.includes('SWIFT'),
+    justSummoned: !card.keywords.includes('SWIFT'),
+    attacked: false,
   };
 }
 
-/** A fresh duel. The player always takes the first turn. */
-export function newDuel(rng) {
+export function newDuel(seed) {
+  uidCounter = 1;
+  const rng = mulberry32(seed);
+  const playerDeck = buildDeck(rng);
+  const foeDeck = buildDeck(rng);
   const state = {
-    rng,
-    turn: 0, // counts full rounds; each side's start increments its own clock
-    active: 'player',
-    phase: 'title', // title | play | over
-    winner: null, // 'player' | 'foe' | 'draw'
+    seed,
+    round: 1,
+    turn: 'player',
+    phase: 'play',
+    winner: null,
     log: [],
-    player: makeDuelist('You', rng, 'p'),
-    foe: makeDuelist('Ashen Warden', rng, 'f'),
+    stats: { playerDamage: 0, foeDamage: 0, playerPlayed: 0, foePlayed: 0 },
+    player: { life: CONFIG.heroLife, maxLife: CONFIG.heroLife, ember: CONFIG.startEmber, maxEmber: CONFIG.startEmber, hand: [], board: [], deck: playerDeck, fatigue: 0, burn: 0 },
+    foe: { life: CONFIG.heroLife, maxLife: CONFIG.heroLife, ember: CONFIG.startEmber, maxEmber: CONFIG.startEmber, hand: [], board: [], deck: foeDeck, fatigue: 0, burn: 0 },
   };
-  drawMany(state.player, DUEL.openingHand);
-  drawMany(state.foe, DUEL.openingHand);
+  drawFrom(state.player.deck, state.player.hand, CONFIG.openingHand, CONFIG.handLimit);
+  drawFrom(state.foe.deck, state.foe.hand, CONFIG.openingHand, CONFIG.handLimit);
+  logLine(state, 'Duel begins. You hold the first ember.');
   return state;
 }
 
-/** The duelist object for a side key ('player' | 'foe'). */
-export function sideOf(state, side) {
-  return side === 'player' ? state.player : state.foe;
+export function logLine(state, text) {
+  state.log.push(text);
+  if (state.log.length > 40) state.log.shift();
 }
 
-/** The other side's key. */
 export function otherSide(side) {
   return side === 'player' ? 'foe' : 'player';
 }
 
-function say(state, line) {
-  state.log.push(line);
-  if (state.log.length > 40) state.log.shift();
-}
-
-/** Summon a minion instance onto a board, ready to render. */
-export function summonMinion(duelist, instance) {
-  const def = defOf(instance);
-  minionSerial += 1;
-  const minion = {
-    uid: `m${minionSerial}`,
-    defId: def.id,
-    attack: def.attack,
-    health: def.health,
-    maxHealth: def.health,
-    keywords: [...(def.keywords || [])],
-    sick: !def.keywords?.includes('swift'), // summoning sickness unless SWIFT
-    attacked: false,
-  };
-  duelist.board.push(minion);
-  return minion;
-}
-
-/** Remove dead minions (health <= 0) from both boards. Returns the fallen. */
-export function sweepDead(state) {
-  const fallen = [];
-  for (const duelist of [state.player, state.foe]) {
-    duelist.board = duelist.board.filter((minion) => {
-      if (minion.health <= 0) {
-        fallen.push(minion);
-        return false;
-      }
-      return true;
-    });
-  }
-  return fallen;
-}
-
-/** Deal damage to a hero, tracking score and the win condition. */
-export function hurtHero(state, side, amount, sourceSide) {
-  const duelist = sideOf(state, side);
-  duelist.health -= amount;
-  if (sourceSide) sideOf(state, sourceSide).damageDealt += amount;
-  checkEnd(state);
-  return amount;
-}
-
-/** Deal damage to one minion. Thorns answers back when the source is a minion. */
-export function hurtMinion(state, side, minion, amount, attacker) {
-  minion.health -= amount;
-  if (attacker && minion.keywords.includes('thorns') && minion.health > 0) {
-    attacker.health -= 1;
-  }
-  sweepDead(state);
-}
-
-/** Heal a hero, never above the starting life total. */
-export function healHero(state, side, amount) {
-  const duelist = sideOf(state, side);
-  const before = duelist.health;
-  duelist.health = Math.min(duelist.maxHealth, duelist.health + amount);
-  return duelist.health - before;
-}
-
-/** Set winner/phase when a hero falls. Both falling together is a draw. */
-export function checkEnd(state) {
-  if (state.phase === 'over') return;
-  const playerDown = state.player.health <= 0;
-  const foeDown = state.foe.health <= 0;
-  if (playerDown && foeDown) {
-    state.winner = 'draw';
-    state.phase = 'over';
-  } else if (foeDown) {
-    state.winner = 'player';
-    state.phase = 'over';
-  } else if (playerDown) {
-    state.winner = 'foe';
-    state.phase = 'over';
-  }
-}
-
-/** Every legal target for a targeted spell, as { side, uid|null } (uid null = hero). */
-export function legalTargets(state, side, card) {
-  const targets = [];
-  if (card.effect.kind === 'buff') {
-    for (const minion of sideOf(state, side).board) targets.push({ side, uid: minion.uid });
-    return targets;
-  }
-  for (const key of ['player', 'foe']) {
-    targets.push({ side: key, uid: null });
-    for (const minion of sideOf(state, key).board) targets.push({ side: key, uid: minion.uid });
-  }
-  return targets;
-}
-
-/** Why a card cannot be played right now, or null when it can. */
-export function playProblem(state, side, instance) {
-  const duelist = sideOf(state, side);
-  const def = defOf(instance);
-  if (state.phase !== 'play') return 'The duel is not running.';
-  if (state.active !== side) return 'It is not your turn.';
-  if (def.cost > duelist.ember) return `Needs ${def.cost} ember — you have ${duelist.ember}.`;
-  if (def.kind === 'minion' && duelist.board.length >= DUEL.boardLimit) return 'Your board is full.';
-  if (def.kind === 'spell' && def.effect.kind === 'buff' && duelist.board.length === 0) {
-    return 'No friendly minion to strengthen.';
-  }
-  return null;
-}
-
-/**
- * Play a card from hand. `target` is { side, uid } for targeted spells.
- * Returns a list of animation events; throws when the play is illegal.
- */
-export function playCard(state, side, instance, target) {
-  const problem = playProblem(state, side, instance);
-  if (problem) throw new Error(problem);
-  const duelist = sideOf(state, side);
-  const foe = sideOf(state, otherSide(side));
-  const def = defOf(instance);
-  const events = [];
-  duelist.ember -= def.cost;
-  duelist.cardsPlayed += 1;
-  duelist.hand = duelist.hand.filter((held) => held.uid !== instance.uid);
-  say(state, `${duelist.name} plays ${def.name}.`);
-  events.push({ type: 'play', side, defId: def.id });
-
-  if (def.kind === 'minion') {
-    const minion = summonMinion(duelist, instance);
-    events.push({ type: 'summon', side, uid: minion.uid });
-    return events;
-  }
-
-  const effect = def.effect;
-  if (effect.kind === 'damage') {
-    if (!target) throw new Error(`${def.name} needs a target.`);
-    if (target.uid === null) {
-      hurtHero(state, target.side, effect.amount, side);
-      events.push({ type: 'heroHit', side: target.side, amount: effect.amount });
-    } else {
-      const victim = sideOf(state, target.side).board.find((m) => m.uid === target.uid);
-      if (!victim) throw new Error('That minion is gone.');
-      hurtMinion(state, target.side, victim, effect.amount, null);
-      events.push({ type: 'minionHit', side: target.side, uid: victim.uid, amount: effect.amount });
-    }
-  } else if (effect.kind === 'damageAll') {
-    for (const victim of [...foe.board]) {
-      hurtMinion(state, otherSide(side), victim, effect.amount, null);
-      events.push({ type: 'minionHit', side: otherSide(side), uid: victim.uid, amount: effect.amount });
-    }
-  } else if (effect.kind === 'heal') {
-    const healed = healHero(state, side, effect.amount);
-    events.push({ type: 'heal', side, amount: healed });
-  } else if (effect.kind === 'draw') {
-    for (const event of drawMany(duelist, effect.amount)) {
-      if (event.type === 'fatigue') hurtHero(state, side, event.amount, null);
-      events.push({ type: 'draw', side, event });
-    }
-  } else if (effect.kind === 'buff') {
-    if (!target || target.uid === null) throw new Error(`${def.name} needs a friendly minion.`);
-    const ally = duelist.board.find((m) => m.uid === target.uid);
-    if (!ally) throw new Error('That minion is gone.');
-    ally.attack += effect.attack;
-    ally.health += effect.health;
-    ally.maxHealth += effect.health;
-    events.push({ type: 'buff', side, uid: ally.uid });
-  } else if (effect.kind === 'burn') {
-    foe.burnTurns = 2;
-    foe.burnAmount = effect.amount;
-    events.push({ type: 'burnSet', side: otherSide(side), amount: effect.amount });
-  }
-  sweepDead(state);
-  checkEnd(state);
-  return events;
-}
-
-/** Minions that may attack this turn: awake, not yet swung. */
-export function readyAttackers(state, side) {
-  return sideOf(state, side).board.filter((m) => !m.sick && !m.attacked && m.attack > 0);
-}
-
-/** Legal attack targets honouring GUARD: guards first, else anything. */
-export function attackTargets(state, side) {
-  const foeSide = otherSide(side);
-  const foe = sideOf(state, foeSide);
-  const guards = foe.board.filter((m) => m.keywords.includes('guard'));
-  const targets = [];
-  if (guards.length > 0) {
-    for (const guard of guards) targets.push({ side: foeSide, uid: guard.uid });
-    return targets;
-  }
-  targets.push({ side: foeSide, uid: null });
-  for (const minion of foe.board) targets.push({ side: foeSide, uid: minion.uid });
-  return targets;
-}
-
-/**
- * One minion attacks one target. Minions trade damage both ways; heroes only
- * take it. Returns animation events.
- */
-export function attackWith(state, side, attackerUid, target) {
-  const duelist = sideOf(state, side);
-  const attacker = duelist.board.find((m) => m.uid === attackerUid);
-  if (!attacker) throw new Error('That minion is gone.');
-  if (attacker.sick) throw new Error('That minion just arrived — it needs a turn to wake.');
-  if (attacker.attacked) throw new Error('That minion already attacked this turn.');
-  const legal = attackTargets(state, side);
-  const allowed = legal.some((t) => t.side === target.side && t.uid === target.uid);
-  if (!allowed) throw new Error('A GUARD minion must be attacked first.');
-  const events = [{ type: 'lunge', side, uid: attacker.uid, target }];
-  attacker.attacked = true;
-  if (target.uid === null) {
-    hurtHero(state, target.side, attacker.attack, side);
-    events.push({ type: 'heroHit', side: target.side, amount: attacker.attack });
-    say(state, `${duelist.name}'s minion strikes the hero for ${attacker.attack}.`);
-  } else {
-    const defender = sideOf(state, target.side).board.find((m) => m.uid === target.uid);
-    if (!defender) throw new Error('That minion is gone.');
-    const dealt = attacker.attack;
-    const taken = defender.attack;
-    hurtMinion(state, target.side, defender, dealt, attacker);
-    if (attacker.health > 0) hurtMinion(state, side, attacker, taken, null);
-    events.push({ type: 'minionHit', side: target.side, uid: defender.uid, amount: dealt });
-    events.push({ type: 'minionHit', side, uid: attacker.uid, amount: taken });
-    say(state, `Minions trade blows: ${dealt} dealt, ${taken} taken.`);
-  }
-  sweepDead(state);
-  checkEnd(state);
-  return events;
-}
-
-/**
- * Begin a side's turn: burn ticks, ember grows and refills, KINDLE minions
- * swell, the board wakes, one card is drawn. Returns animation events.
- */
 export function startTurn(state, side) {
-  const duelist = sideOf(state, side);
-  const events = [];
-  state.active = side;
-  if (side === 'player') state.turn += 1;
-  if (duelist.burnTurns > 0) {
-    duelist.burnTurns -= 1;
-    hurtHero(state, side, duelist.burnAmount, otherSide(side));
-    events.push({ type: 'heroHit', side, amount: duelist.burnAmount, burn: true });
-    say(state, `${duelist.name} burns for ${duelist.burnAmount}.`);
+  const p = state[side];
+  p.maxEmber = Math.min(CONFIG.maxEmber, p.maxEmber + (state.round > 1 || side === 'foe' ? 0 : 0));
+  // Ember growth: +1 max at the start of each of your turns after round 1.
+  if (state.round > 1 || side === 'foe') {
+    p.maxEmber = Math.min(CONFIG.maxEmber, p.maxEmber + 1);
+    if (side === 'player' && state.round === 1) p.maxEmber = CONFIG.startEmber;
   }
-  duelist.emberMax = Math.min(DUEL.emberMax, duelist.emberMax + 1);
-  duelist.ember = duelist.emberMax;
-  for (const minion of duelist.board) {
-    minion.sick = false;
-    minion.attacked = false;
-    if (minion.keywords.includes('kindle')) {
-      minion.attack += 1;
-      events.push({ type: 'buff', side, uid: minion.uid });
+  if (side === 'player' && state.round === 1) p.maxEmber = CONFIG.startEmber;
+  p.ember = p.maxEmber;
+  for (const m of p.board) {
+    m.canAttack = true;
+    m.justSummoned = false;
+    m.attacked = false;
+    if (m.keywords.includes('KINDLE')) m.attack += 1;
+  }
+  // Burn tick at turn start.
+  if (p.burn > 0) {
+    damageHero(state, side, p.burn, 'burn');
+    p.burn = 0;
+    logLine(state, side === 'player' ? 'Smoulder burns you.' : 'Smoulder burns the Warden.');
+  }
+  // Draw 1 (skip on the very first player turn: opening hand already dealt).
+  const isFirstPlayerTurn = side === 'player' && state.round === 1 && p.hand.length === CONFIG.openingHand && !state._drewOnce;
+  if (!isFirstPlayerTurn) {
+    drawCards(state, side, 1);
+  } else {
+    state._drewOnce = true;
+  }
+  checkWin(state);
+}
+
+export function drawCards(state, side, count) {
+  const p = state[side];
+  for (let i = 0; i < count; i++) {
+    if (!p.deck.length) {
+      p.fatigue += 1;
+      damageHero(state, side, p.fatigue, 'fatigue');
+      logLine(state, side === 'player' ? `Fatigue bites you for ${p.fatigue}.` : `Fatigue bites the Warden for ${p.fatigue}.`);
+    } else {
+      drawFrom(p.deck, p.hand, 1, CONFIG.handLimit);
     }
   }
-  const drawn = drawOne(duelist);
-  if (drawn.type === 'fatigue') hurtHero(state, side, drawn.amount, null);
-  events.push({ type: 'draw', side, event: drawn });
-  say(state, `${duelist.name}'s turn — ${duelist.ember} ember.`);
-  checkEnd(state);
-  return events;
+  checkWin(state);
 }
 
-/** Hand the turn over. Returns the next side's start-of-turn events. */
+export function damageHero(state, side, amount, source = 'hit') {
+  const p = state[side];
+  p.life = Math.max(0, p.life - amount);
+  if (side === 'foe') state.stats.playerDamage += amount;
+  else state.stats.foeDamage += amount;
+  checkWin(state);
+}
+
+export function healHero(state, side, amount) {
+  const p = state[side];
+  p.life = Math.min(p.maxLife, p.life + amount);
+}
+
+export function canPlay(state, side, handIndex) {
+  const p = state[side];
+  const card = cardById(p.hand[handIndex]);
+  if (!card) return { ok: false, reason: 'No card' };
+  if (state.turn !== side) return { ok: false, reason: 'Not your turn' };
+  if (state.winner) return { ok: false, reason: 'Duel over' };
+  if (card.cost > p.ember) return { ok: false, reason: 'Not enough ember' };
+  if (card.kind === 'minion' && p.board.length >= CONFIG.boardLimit) return { ok: false, reason: 'Board full' };
+  return { ok: true, card };
+}
+
+export function playCard(state, side, handIndex, target = null) {
+  const check = canPlay(state, side, handIndex);
+  if (!check.ok) return { ok: false, reason: check.reason, events: [] };
+  const p = state[side];
+  const foeSide = otherSide(side);
+  const card = check.card;
+  const events = [];
+  p.hand.splice(handIndex, 1);
+  p.ember -= card.cost;
+  if (side === 'player') state.stats.playerPlayed += 1; else state.stats.foePlayed += 1;
+  const who = side === 'player' ? 'You play' : 'Warden plays';
+  if (card.kind === 'minion') {
+    const m = makeMinion(card.id, side);
+    p.board.push(m);
+    logLine(state, `${who} ${card.name} (${card.attack}/${card.health}).`);
+    events.push({ type: 'summon', side, uid: m.uid, cardId: card.id });
+    return { ok: true, events };
+  }
+  // Spells
+  logLine(state, `${who} ${card.name}.`);
+  if (card.effect === 'damage-any') {
+    if (target && target.type === 'hero') {
+      damageHero(state, target.side, card.amount);
+      events.push({ type: 'damage-hero', side: target.side, amount: card.amount });
+    } else if (target && target.type === 'minion') {
+      const hit = damageMinion(state, target.side, target.uid, card.amount);
+      events.push({ type: 'damage-minion', ...hit });
+    } else {
+      // No target given: hit enemy hero (AI default).
+      damageHero(state, foeSide, card.amount);
+      events.push({ type: 'damage-hero', side: foeSide, amount: card.amount });
+    }
+  } else if (card.effect === 'damage-all-foe') {
+    const targets = state[foeSide].board.map((m) => m.uid);
+    for (const uid of targets) damageMinion(state, foeSide, uid, card.amount);
+    events.push({ type: 'sweep', side: foeSide, amount: card.amount });
+  } else if (card.effect === 'heal-hero') {
+    healHero(state, side, card.amount);
+    events.push({ type: 'heal', side, amount: card.amount });
+  } else if (card.effect === 'draw') {
+    drawCards(state, side, card.amount);
+    events.push({ type: 'draw', side, amount: card.amount });
+  } else if (card.effect === 'buff') {
+    const m = p.board.find((x) => x.uid === (target && target.uid));
+    if (m) {
+      m.attack += card.amount; m.health += card.amount; m.maxHealth += card.amount;
+      events.push({ type: 'buff', side, uid: m.uid, amount: card.amount });
+    }
+  } else if (card.effect === 'burn-hero') {
+    damageHero(state, foeSide, card.amount);
+    state[foeSide].burn = card.amount;
+    events.push({ type: 'burn', side: foeSide, amount: card.amount });
+  }
+  cleanup(state);
+  checkWin(state);
+  return { ok: true, events };
+}
+
+export function damageMinion(state, side, uid, amount) {
+  const p = state[side];
+  const m = p.board.find((x) => x.uid === uid);
+  if (!m) return { side, uid, amount: 0, died: false };
+  m.health -= amount;
+  return { side, uid, amount, died: m.health <= 0 };
+}
+
+export function cleanup(state) {
+  for (const side of ['player', 'foe']) {
+    state[side].board = state[side].board.filter((m) => m.health > 0);
+  }
+}
+
+export function guardsOn(state, side) {
+  return state[side].board.filter((m) => m.keywords.includes('GUARD') && m.health > 0);
+}
+
+export function canAttack(state, side, attackerUid, target) {
+  if (state.turn !== side || state.winner) return { ok: false, reason: 'Not your turn' };
+  const atk = state[side].board.find((m) => m.uid === attackerUid);
+  if (!atk) return { ok: false, reason: 'No attacker' };
+  if (!atk.canAttack || atk.attacked) return { ok: false, reason: 'Not ready' };
+  const foeSide = otherSide(side);
+  const guards = guardsOn(state, foeSide);
+  if (target.type === 'hero' && guards.length) return { ok: false, reason: 'A GUARD blocks the hero' };
+  if (target.type === 'minion' && guards.length && !guards.some((g) => g.uid === target.uid)) {
+    return { ok: false, reason: 'A GUARD must be attacked first' };
+  }
+  return { ok: true, attacker: atk };
+}
+
+export function attack(state, side, attackerUid, target) {
+  const check = canAttack(state, side, attackerUid, target);
+  if (!check.ok) return { ok: false, reason: check.reason, events: [] };
+  const atk = check.attacker;
+  const foeSide = otherSide(side);
+  const events = [];
+  atk.attacked = true;
+  atk.canAttack = false;
+  if (target.type === 'hero') {
+    damageHero(state, foeSide, atk.attack);
+    logLine(state, `${side === 'player' ? 'Your' : 'Warden'} ${cardById(atk.cardId).name} hits ${foeSide === 'player' ? 'you' : 'the Warden'} for ${atk.attack}.`);
+    events.push({ type: 'damage-hero', side: foeSide, amount: atk.attack });
+  } else {
+    const def = state[foeSide].board.find((m) => m.uid === target.uid);
+    if (!def) return { ok: false, reason: 'No target', events: [] };
+    def.health -= atk.attack;
+    atk.health -= def.attack;
+    if (def.keywords.includes('THORNS')) atk.health -= 1;
+    logLine(state, `${cardById(atk.cardId).name} trades with ${cardById(def.cardId).name}.`);
+    events.push({ type: 'trade', attackerUid, defenderUid: def.uid, aDmg: atk.attack, dDmg: def.attack });
+  }
+  cleanup(state);
+  checkWin(state);
+  return { ok: true, events };
+}
+
 export function endTurn(state) {
-  if (state.phase !== 'play') return [];
-  return startTurn(state, otherSide(state.active));
+  if (state.winner) return state;
+  if (state.turn === 'player') {
+    state.turn = 'foe';
+  } else {
+    state.turn = 'player';
+    state.round += 1;
+  }
+  startTurn(state, state.turn);
+  return state;
 }
 
-/** Total attack a board threatens next turn (the AI and the intent banner use it). */
-export function boardThreat(duelist) {
-  return duelist.board.reduce((sum, m) => sum + m.attack, 0);
+export function checkWin(state) {
+  if (state.foe.life <= 0 && state.player.life <= 0) state.winner = 'player';
+  else if (state.foe.life <= 0) state.winner = 'player';
+  else if (state.player.life <= 0) state.winner = 'foe';
+  return state.winner;
 }
 
-/** Total health standing on a board — the other half of a board's weight. */
-export function boardBulk(duelist) {
-  return duelist.board.reduce((sum, m) => sum + m.health, 0);
+export function boardPower(state, side) {
+  return state[side].board.reduce((n, m) => n + m.attack, 0);
 }
 
-/** True when a side has lethal on board against the enemy hero right now. */
-export function hasLethal(state, side) {
-  const foe = sideOf(state, otherSide(side));
-  const guards = foe.board.some((m) => m.keywords.includes('guard'));
-  if (guards) return false;
-  const ready = readyAttackers(state, side).reduce((sum, m) => sum + m.attack, 0);
-  return ready >= foe.health;
+export function readyAttackers(state, side) {
+  return state[side].board.filter((m) => m.canAttack && !m.attacked);
+}
+
+export function isOver(state) {
+  return state.winner !== null;
 }

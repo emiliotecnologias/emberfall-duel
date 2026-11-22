@@ -1,54 +1,41 @@
-// EMBERFALL DUEL — seeded randomness.
-// One small deterministic generator drives shuffles and AI tie-breaks, so a
-// seed in the address bar (?seed=7) replays the exact same duel every time.
-// Screenshot mode leans on this: same seed, same table, same picture.
-
-/** Mulberry32: a tiny 32-bit generator with a full period for its state. */
-export function makeRng(seed) {
-  let state = (seed >>> 0) || 1;
+// Seeded randomness: mulberry32 so a duel replays from ?seed=.
+export function mulberry32(seed) {
+  let a = seed >>> 0;
   return function next() {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let t = state;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-/** A whole number from min to max, both ends included. */
-export function randInt(rng, min, max) {
-  return min + Math.floor(rng() * (max - min + 1));
-}
-
-/** Fisher-Yates shuffle, in place, driven by the seeded generator. */
-export function shuffle(rng, list) {
-  for (let i = list.length - 1; i > 0; i -= 1) {
+export function shuffle(list, rng) {
+  const out = list.slice();
+  for (let i = out.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
-    const held = list[i];
-    list[i] = list[j];
-    list[j] = held;
+    const tmp = out[i]; out[i] = out[j]; out[j] = tmp;
   }
-  return list;
+  return out;
 }
 
-/** Pick one entry from a list, or null when the list is empty. */
-export function pick(rng, list) {
-  if (list.length === 0) return null;
+export function seedFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const raw = params.get('seed');
+  if (raw === null) return Math.floor(Math.random() * 1000000000);
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? n : 1;
+}
+
+export function shotFromUrl() {
+  const params = new URLSearchParams(location.search);
+  return params.get('shot') || '';
+}
+
+export function pick(list, rng) {
+  if (!list.length) return null;
   return list[Math.floor(rng() * list.length)];
 }
 
-/** True with probability p (0..1), driven by the seeded generator. */
-export function chance(rng, p) {
-  return rng() < p;
-}
-
-/** Read ?seed= from the address bar; fall back to a fresh random seed. */
-export function seedFromUrl(search) {
-  const params = new URLSearchParams(search || '');
-  const raw = params.get('seed');
-  if (raw !== null && raw !== '') {
-    const parsed = Number.parseInt(raw, 10);
-    if (Number.isFinite(parsed)) return parsed >>> 0;
-  }
-  return (Math.random() * 0xffffffff) >>> 0;
+export function seededInt(rng, min, max) {
+  return min + Math.floor(rng() * (max - min + 1));
 }

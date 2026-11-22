@@ -1,11 +1,8 @@
-// EMBERFALL DUEL — make.fun "Make the best card game" entry runner.
-// Node 22, standard library only. Copies game/ and screenshots/ into
-// $MAKEFUN_OUTPUT_DIR (default /output) and writes dossier.json there,
-// using buildDossier from ./vendor/makefun-game.ts (the kit library).
-//
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-
-import { cpSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+// EMBERFALL DUEL hand-in (Node 22, standard library only): copies game/ and
+// screenshots/ beside this file to /output and writes dossier.json with the
+// vendored make.fun library. Outside the grader, MAKEFUN_OUTPUT_DIR stands
+// in for /output:  mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
@@ -16,10 +13,9 @@ const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 mkdirSync(out, { recursive: true });
 cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
 mkdirSync(join(out, 'screenshots'), { recursive: true });
-if (existsSync(join(here, 'screenshots'))) {
-  cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
-}
+if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
 
+// Caps mirror the scorer's gate so a local run fails exactly where the gate would.
 writeFileSync(
   join(out, 'dossier.json'),
   buildDossier(out, {
@@ -30,7 +26,3 @@ writeFileSync(
     game_path_max_bytes: 1000,
   }),
 );
-
-const shots = readdirSync(join(out, 'screenshots')).filter((f) => /\.(png|jpe?g)$/i.test(f));
-const gameFiles = readdirSync(join(out, 'game', 'src')).length + 1; // src files + index.html
-console.log(`EMBERFALL DUEL bundle written to ${out} (game files: ${gameFiles}, screenshots: ${shots.length})`);

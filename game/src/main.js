@@ -1,307 +1,186 @@
-// EMBERFALL DUEL — boot, input and turn flow.
-// Wires the rules engine to the renderer: mouse clicks and keyboard picks go
-// through the same legal-move checks, the Warden's turn animates one visible
-// action at a time, and ?shot= renders frozen states for screenshots.
-
-import { BEATS, BEST_KEY, FIELD } from './config.js';
-import { makeRng, seedFromUrl } from './random.js';
-import { attackTargets, attackWith, endTurn, newDuel, playCard, playProblem, startTurn } from './state.js';
-import { defOf } from './deck.js';
-import { needsTarget, targetSide } from './cards.js';
-import { planFoeTurn } from './ai.js';
-import { renderEnd, renderTable, renderTitle } from './render.js';
-import { shotState, titleShowcase } from './shots.js';
-import { emberRain, floatNumber, replayClass, sparkBurst, sfx, stagePoint, wakeAudio } from './fx.js';
+// Boot, input and turn flow. Wires state + AI + render + fx together.
+import { CONFIG, BEATS } from './config.js';
+import { cardById, needsTarget } from './cards.js';
+import { newDuel, playCard, attack, endTurn, canPlay } from './state.js';
+import { nextFoeAction, applyFoeAction } from './ai.js';
+import { renderTitle, renderTable, renderEnd } from './render.js';
+import { sfx, ensureAudio, emberRain, shakeEl } from './fx.js';
+import { seedFromUrl, shotFromUrl } from './random.js';
+import { shotState, isShotMode } from './shots.js';
 
 const stage = document.getElementById('stage');
-const fxLayer = document.getElementById('fx-layer');
-const statusLine = document.getElementById('status');
-
+const status = document.getElementById('status');
 let state = null;
-let busy = false; // true while the Warden's turn animates
-const ui = {
-  selectedCard: null, // hand instance uid awaiting a target
-  selectedAttacker: null, // board minion uid awaiting a target
-  targetMode: null, // 'spell' | 'buff' | 'attack'
-  hint: null,
-  justSummoned: new Set(),
-  dealt: new Set(),
-};
+let ui = { selectedCard: -1, selectedMinion: null, targeting: false, targetingSpell: false, busy: false, hint: '' };
 
-/** Scale the fixed 1280x720 stage to fit the window, letterboxed. */
 function fitStage() {
-  const scale = Math.min(window.innerWidth / FIELD.width, window.innerHeight / FIELD.height);
+  const scale = Math.min(window.innerWidth / CONFIG.stageW, window.innerHeight / CONFIG.stageH);
   stage.style.transform = `translate(-50%, -50%) scale(${scale})`;
 }
 window.addEventListener('resize', fitStage);
 
-/** Announce a line to screen readers and the hint bar. */
-function announce(text) {
-  statusLine.textContent = text;
-  ui.hint = text;
-}
+function setStatus(text) { if (status) status.textContent = text; }
 
-/** Persist the best result line shown on end screens. */
-function bestLine() {
-  try { return window.localStorage.getItem(BEST_KEY); } catch { return null; }
-}
-function saveBest() {
-  try {
-    const line = `Won in ${state.turn} rounds with ${Math.max(0, state.player.health)} life left`;
-    const previous = bestLine();
-    if (!previous || state.winner === 'player') window.localStorage.setItem(BEST_KEY, line);
-  } catch { /* private mode: the duel still plays */ }
-}
-
-/** Redraw the table (or the end screen when the duel is over). */
 function draw() {
   if (!state) return;
-  if (state.phase === 'over') {
-    renderEnd(stage, state, bestLine());
-    if (state.winner === 'player') {
-      emberRain(fxLayer);
-      sfx.win();
-    } else if (state.winner === 'foe') {
-      sfx.lose();
-    }
-    return;
-  }
-  renderTable(stage, state, ui);
+  if (state.winner === 'player') { renderEnd(stage, state, true, startDuel); return; }
+  if (state.winner === 'foe') { renderEnd(stage, state, false, startDuel); return; }
+  renderTable(stage, state, ui, handlers);
 }
 
-/** Floating feedback for one batch of rule events. */
-function playEvents(events) {
-  for (const event of events) {
-    if (event.type === 'play') sfx.play();
-    if (event.type === 'summon') { sfx.summon(); ui.justSummoned.add(event.uid); }
-    if (event.type === 'draw') sfx.draw();
-    if (event.type === 'heal') sfx.heal();
-    if (event.type === 'buff') sfx.buff();
-    if (event.type === 'burnSet') sfx.burn();
-    if (event.type === 'heroHit') {
-      sfx.hurt();
-      const plate = stage.querySelector(`.hero-plate.side-${event.side}`);
-      if (plate) {
-        const point = stagePoint(plate, stage);
-        floatNumber(fxLayer, point.x, point.y - 30, `-${event.amount}`, 'damage');
-        sparkBurst(fxLayer, point.x, point.y, 8);
-        replayClass(plate, 'shaken');
-      }
-    }
-    if (event.type === 'minionHit') {
-      sfx.hit();
-      const token = stage.querySelector(`.minion[data-uid="${event.uid}"]`);
-      if (token) {
-        const point = stagePoint(token, stage);
-        floatNumber(fxLayer, point.x, point.y - 24, `-${event.amount}`, 'damage');
-        replayClass(token, 'shaken');
-      }
-    }
-  }
-}
-
-/** Start a fresh duel from the title screen or an end screen. */
-function startDuel() {
-  wakeAudio();
-  const rngSeed = seedFromUrl(window.location.search);
-  state = newDuel(makeRng(rngSeed));
-  state.phase = 'play';
-  ui.selectedCard = null;
-  ui.selectedAttacker = null;
-  ui.targetMode = null;
-  ui.justSummoned.clear();
-  ui.dealt = new Set(state.player.hand.map((held) => held.uid));
-  startTurn(state, 'player');
-  announce('Your turn. Play a card, attack with ready minions, then end the turn.');
-  draw();
-  sfx.deal();
-}
-
-/** Clear any half-made selection. */
 function clearSelection() {
-  ui.selectedCard = null;
-  ui.selectedAttacker = null;
-  ui.targetMode = null;
+  ui.selectedCard = -1; ui.selectedMinion = null; ui.targeting = false; ui.targetingSpell = false;
 }
 
-/** Try to play the selected hand card, with or without a target. */
-function commitCard(target) {
-  const instance = state.player.hand.find((held) => held.uid === ui.selectedCard);
-  if (!instance) return;
-  try {
-    const events = playCard(state, 'player', instance, target);
-    clearSelection();
-    draw();
-    playEvents(events);
-    if (state.phase === 'over') saveBest();
-    draw();
-  } catch (error) {
-    sfx.error();
-    announce(error.message);
-    draw();
+function afterAction(events) {
+  for (const ev of events || []) {
+    if (ev.type === 'summon') sfx.summon();
+    else if (ev.type === 'damage-hero' || ev.type === 'trade') sfx.hit();
+    else if (ev.type === 'heal') sfx.heal();
+    else if (ev.type === 'buff') sfx.buff();
+    else if (ev.type === 'burn' || ev.type === 'sweep') sfx.burn();
+    else sfx.play();
+  }
+  draw();
+  if (state.winner === 'player') { sfx.win(); emberRain(stage, 36); setStatus('Victory!'); }
+  if (state.winner === 'foe') { sfx.lose(); setStatus('Defeat.'); }
+}
+
+function onHandCard(index) {
+  ensureAudio();
+  if (state.turn !== 'player' || ui.busy) return;
+  const card = cardById(state.player.hand[index]);
+  if (!card) return;
+  const check = canPlay(state, 'player', index);
+  if (!check.ok) { sfx.error(); ui.hint = check.reason + '. Pick another card.'; draw(); return; }
+  if (needsTarget(card)) {
+    ui.selectedCard = index; ui.selectedMinion = null;
+    ui.targeting = card.effect === 'damage-any';
+    ui.targetingSpell = card.effect === 'buff';
+    ui.hint = card.effect === 'buff' ? 'Choose a friendly minion to buff (+2/+2). Esc cancels.' : 'Choose a target: click a minion, or the hero plate area via a minion. Esc cancels.';
+    sfx.deal(); draw(); return;
+  }
+  const res = playCard(state, 'player', index, null);
+  clearSelection();
+  ui.hint = '';
+  afterAction(res.events);
+}
+
+function onPlayerMinion(uid) {
+  ensureAudio();
+  if (ui.targetingSpell && ui.selectedCard >= 0) {
+    const res = playCard(state, 'player', ui.selectedCard, { type: 'minion', side: 'player', uid });
+    clearSelection(); ui.hint = ''; afterAction(res.events); return;
+  }
+  if (ui.targeting && ui.selectedCard >= 0) {
+    const res = playCard(state, 'player', ui.selectedCard, { type: 'minion', side: 'player', uid });
+    clearSelection(); ui.hint = ''; afterAction(res.events); return;
+  }
+  const m = state.player.board.find((x) => x.uid === uid);
+  if (!m) return;
+  if (!m.canAttack || m.attacked) { ui.hint = cardById(m.cardId).name + ' is not ready yet.'; draw(); return; }
+  ui.selectedMinion = uid; ui.selectedCard = -1; ui.targeting = true;
+  ui.hint = 'Attack with ' + cardById(m.cardId).name + ': click an enemy minion (GUARD first) — or click again to go face if no GUARD.';
+  draw();
+}
+
+function onFoeMinion(uid) {
+  ensureAudio();
+  if (ui.selectedCard >= 0 && ui.targeting) {
+    const res = playCard(state, 'player', ui.selectedCard, { type: 'minion', side: 'foe', uid });
+    clearSelection(); ui.hint = ''; afterAction(res.events); return;
+  }
+  if (ui.selectedMinion) {
+    const res = attack(state, 'player', ui.selectedMinion, { type: 'minion', side: 'foe', uid });
+    if (!res.ok) { sfx.error(); ui.hint = res.reason + '.'; draw(); return; }
+    clearSelection(); ui.hint = ''; afterAction(res.events); return;
   }
 }
 
-/** Try to attack with the selected minion. */
-function commitAttack(target) {
-  try {
-    const events = attackWith(state, 'player', ui.selectedAttacker, target);
-    clearSelection();
-    draw();
-    playEvents(events);
-    if (state.phase === 'over') saveBest();
-    draw();
-  } catch (error) {
-    sfx.error();
-    announce(error.message);
-    draw();
-  }
+function onEndTurn() {
+  ensureAudio();
+  if (state.turn !== 'player' || ui.busy || state.winner) return;
+  clearSelection(); ui.hint = '';
+  sfx.turn();
+  endTurn(state);
+  draw();
+  runFoeTurn();
 }
 
-/** A hand card was clicked: select it, or play it at once if it needs no target. */
-function pickCard(uid) {
-  if (busy || state.active !== 'player' || state.phase !== 'play') return;
-  const instance = state.player.hand.find((held) => held.uid === uid);
-  if (!instance) return;
-  const problem = playProblem(state, 'player', instance);
-  if (problem) {
-    sfx.error();
-    announce(problem);
-    draw();
-    return;
+async function runFoeTurn() {
+  ui.busy = true;
+  draw();
+  await sleep(BEATS.aiThinkMs);
+  let guard = 0;
+  while (!state.winner && guard < 24) {
+    const action = nextFoeAction(state);
+    if (!action) break;
+    const res = applyFoeAction(state, action);
+    afterAction(res.events);
+    shakeEl(stage.querySelector('.table-screen'));
+    await sleep(BEATS.aiStepMs);
+    guard++;
   }
-  const def = defOf(instance);
-  ui.selectedCard = uid;
-  ui.selectedAttacker = null;
-  if (needsTarget(def)) {
-    ui.targetMode = targetSide(def) === 'friendly' ? 'buff' : 'spell';
-    announce(ui.targetMode === 'buff'
-      ? `${def.name}: click one of your minions to strengthen it.`
-      : `${def.name}: click a hero or minion to aim it.`);
-    draw();
+  ui.busy = false;
+  if (!state.winner) {
+    endTurn(state);
+    sfx.turn();
+    setStatus('Your turn — round ' + state.round);
+  }
+  draw();
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function duelSeedLabel() {
+  return 'Seed ' + (state ? state.seed : '?');
+}
+
+const handlers = { onHandCard, onPlayerMinion, onFoeMinion, onEndTurn };
+
+function startDuel() {
+  ensureAudio();
+  state = newDuel(seedFromUrl());
+  clearSelection(); ui.busy = false; ui.hint = '';
+  setStatus('Duel started — your turn.');
+  sfx.deal();
+  draw();
+}
+
+document.addEventListener('keydown', (e) => {
+  if (!state) return;
+  if (e.key === 'Escape') { clearSelection(); ui.hint = ''; draw(); return; }
+  if (e.code === 'Space') { e.preventDefault(); onEndTurn(); return; }
+  const n = Number.parseInt(e.key, 10);
+  if (n >= 1 && n <= 7) onHandCard(n - 1);
+});
+
+// Face-attack helper: double-click foe hero plate area goes face.
+stage.addEventListener('dblclick', () => {
+  if (state && ui.selectedMinion) {
+    const res = attack(state, 'player', ui.selectedMinion, { type: 'hero', side: 'foe' });
+    if (!res.ok) { sfx.error(); ui.hint = res.reason + '.'; draw(); return; }
+    clearSelection(); ui.hint = ''; afterAction(res.events);
+  }
+  if (state && ui.selectedCard >= 0 && ui.targeting) {
+    const res = playCard(state, 'player', ui.selectedCard, { type: 'hero', side: 'foe' });
+    clearSelection(); ui.hint = ''; afterAction(res.events);
+  }
+});
+
+fitStage();
+const shot = shotFromUrl();
+if (isShotMode(shot)) {
+  if (shot === 'title') {
+    renderTitle(stage, startDuel);
+    setStatus('Screenshot: title');
   } else {
-    commitCard(null);
+    state = shotState(shot, seedFromUrl());
+    if (shot === 'table') { draw(); setStatus('Screenshot: table'); }
+    else if (shot === 'win') { renderEnd(stage, state, true, startDuel); setStatus('Screenshot: win'); }
+    else { renderEnd(stage, state, false, startDuel); setStatus('Screenshot: loss'); }
   }
+} else {
+  renderTitle(stage, startDuel);
+  setStatus('EMBERFALL DUEL ready');
 }
-
-/** A board minion or hero was clicked: an attacker pick or a target pick. */
-function pickBoard(side, uid) {
-  if (busy || state.active !== 'player' || state.phase !== 'play') return;
-  if (ui.targetMode === 'attack' && ui.selectedAttacker) {
-    commitAttack({ side, uid });
-    return;
-  }
-  if (ui.targetMode === 'spell' && ui.selectedCard) {
-    commitCard({ side, uid });
-    return;
-  }
-  if (ui.targetMode === 'buff' && ui.selectedCard && side === 'player' && uid !== null) {
-    commitCard({ side, uid });
-    return;
-  }
-  if (side === 'player' && uid !== null) {
-    const minion = state.player.board.find((m) => m.uid === uid);
-    if (!minion) return;
-    if (minion.sick) { announce('That minion just arrived — it wakes next turn.'); draw(); return; }
-    if (minion.attacked) { announce('That minion already attacked this turn.'); draw(); return; }
-    ui.selectedAttacker = uid;
-    ui.selectedCard = null;
-    ui.targetMode = 'attack';
-    const legal = attackTargets(state, 'player');
-    announce(legal.some((t) => t.uid === null)
-      ? 'Choose a target: the Warden or one of its minions.'
-      : 'A GUARD blocks the way — attack the guard first.');
-    draw();
-  }
-}
-
-/** End the player's turn, then animate the Warden's turn step by step. */
-async function finishTurn() {
-  if (busy || state.active !== 'player' || state.phase !== 'play') return;
-  clearSelection();
-  busy = true;
-  const foeEvents = endTurn(state);
-  sfx.turn();
-  draw();
-  playEvents(foeEvents);
-  draw();
-  if (state.phase !== 'over') {
-    const steps = planFoeTurn(state);
-    for (const step of steps) {
-      draw();
-      playEvents(step);
-      await new Promise((resolve) => window.setTimeout(resolve, BEATS.foeStep));
-      if (state.phase === 'over') break;
-    }
-  }
-  if (state.phase === 'over') {
-    saveBest();
-    busy = false;
-    draw();
-    return;
-  }
-  const playerEvents = endTurn(state);
-  sfx.turn();
-  busy = false;
-  announce('Your turn. The Warden\'s intent is on the banner — counter it.');
-  draw();
-  playEvents(playerEvents);
-  draw();
-}
-
-/** Mouse: one delegated listener for cards, minions, heroes and buttons. */
-stage.addEventListener('click', (event) => {
-  wakeAudio();
-  const playButton = event.target.closest('#play-button');
-  if (playButton) { startDuel(); return; }
-  if (event.target.closest('#end-turn')) { finishTurn(); return; }
-  if (!state || state.phase !== 'play') return;
-  const card = event.target.closest('.player-hand .card');
-  if (card) { pickCard(card.dataset.uid); return; }
-  const minion = event.target.closest('.minion');
-  if (minion) {
-    const side = minion.classList.contains('side-foe') ? 'foe' : 'player';
-    pickBoard(side, minion.dataset.uid);
-    return;
-  }
-  const hero = event.target.closest('.hero-plate');
-  if (hero) { pickBoard(hero.dataset.side, null); return; }
-  clearSelection();
-  draw();
-});
-
-/** Keyboard: 1–7 pick a hand card, Enter confirms, Space ends, Esc cancels. */
-window.addEventListener('keydown', (event) => {
-  if (!state || state.phase !== 'play' || busy) return;
-  if (event.key >= '1' && event.key <= '7') {
-    const held = state.player.hand[Number(event.key) - 1];
-    if (held) pickCard(held.uid);
-  } else if (event.key === ' ' || event.key === 'Enter') {
-    if (event.key === ' ') { event.preventDefault(); finishTurn(); }
-  } else if (event.key === 'Escape') {
-    clearSelection();
-    draw();
-  }
-});
-
-/** Boot: screenshot mode renders one frozen state; otherwise the title screen. */
-function boot() {
-  fitStage();
-  const params = new URLSearchParams(window.location.search);
-  const shot = params.get('shot');
-  const seed = seedFromUrl(window.location.search);
-  if (shot) {
-    document.body.classList.add('shot-mode');
-    if (shot === 'title') {
-      renderTitle(stage, titleShowcase(seed));
-    } else {
-      state = shotState(shot, seed);
-      if (state.phase === 'over') renderEnd(stage, state, null);
-      else renderTable(stage, state, ui);
-    }
-    return;
-  }
-  renderTitle(stage, titleShowcase(seed));
-}
-
-boot();

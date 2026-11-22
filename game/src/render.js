@@ -1,298 +1,212 @@
-// EMBERFALL DUEL — the renderer.
-// Builds the whole table as DOM inside a fixed 1280x720 stage: title screen,
-// both heroes with life totals, both hands, both boards, the ember track, the
-// Warden's intent banner, the duel log, and the win/loss screens. Cards are
-// told apart by suit colour, shape and glyph — never by text alone — and stay
-// legible when the screenshot shrinks to a thumbnail.
+// DOM rendering: cards, minions, hero plates, screens. No game rules here.
+import { CONFIG, SUITS, HEROES, lifePercent } from './config.js';
+import { cardById, showcaseCards } from './cards.js';
+import { foeIntent } from './ai.js';
 
-import { KEYWORDS, SUITS } from './config.js';
-import { defOf } from './deck.js';
-import { intent } from './ai.js';
-
-function el(tag, className, text) {
+export function el(tag, cls, text) {
   const node = document.createElement(tag);
-  if (className) node.className = className;
+  if (cls) node.className = cls;
   if (text !== undefined) node.textContent = text;
   return node;
 }
 
-/** The cost gem every card wears in its top-left corner. */
-function costGem(cost) {
-  const gem = el('div', 'cost-gem', String(cost));
-  gem.title = `Costs ${cost} ember`;
-  return gem;
+export function clearStage(stage) {
+  stage.innerHTML = '';
 }
 
-/** Attack/health badges: sword chip bottom-left, heart chip bottom-right. */
-function statBadges(attack, health, hurt) {
-  const wrap = el('div', 'stat-badges');
-  const atk = el('div', 'badge atk', `⚔ ${attack}`);
-  const hp = el('div', `badge hp${hurt ? ' hurt' : ''}`, `♥ ${health}`);
-  wrap.append(atk, hp);
-  return wrap;
+export function suitBadge(card) {
+  const suit = SUITS[card.suit];
+  const badge = el('span', 'suit-badge suit-' + card.suit, suit.glyph + ' ' + suit.name);
+  badge.title = suit.name + ' suit';
+  return badge;
 }
 
-/** Keyword chips (GUARD / SWIFT / THORNS / KINDLE) under a card's name. */
-function keywordChips(keywords) {
-  const wrap = el('div', 'keyword-chips');
-  for (const keyword of keywords || []) {
-    wrap.append(el('span', `chip kw-${keyword}`, KEYWORDS[keyword] || keyword));
-  }
-  return wrap;
-}
-
-/**
- * One full card face. `size` is 'hand' | 'mini'; `state` carries selection,
- * affordability and the keyboard number printed on hand cards.
- */
-export function cardFace(instance, size, state) {
-  const def = defOf(instance);
-  const suit = SUITS[def.suit];
-  const card = el('div', `card suit-${def.suit} size-${size}`);
-  card.dataset.uid = instance.uid;
-  card.style.setProperty('--suit', suit.color);
-  card.style.setProperty('--suit-deep', suit.deep);
-  if (state?.selected) card.classList.add('selected');
-  if (state?.unaffordable) card.classList.add('unaffordable');
-  if (state?.dealt) card.classList.add('dealt');
-
+export function cardEl(card, opts = {}) {
+  const suit = SUITS[card.suit];
+  const root = el('div', 'card suit-' + card.suit + (opts.small ? ' card-small' : '') + (opts.selected ? ' selected' : '') + (opts.disabled ? ' disabled' : ''));
+  root.dataset.cardId = card.id;
   const head = el('div', 'card-head');
-  head.append(costGem(def.cost));
-  head.append(el('div', 'card-name', def.name));
-  head.append(el('div', 'suit-glyph', suit.glyph));
-  card.append(head);
-  card.append(el('div', 'card-kind', def.kind === 'minion' ? 'MINION' : 'SPELL'));
-  card.append(keywordChips(def.keywords));
-  card.append(el('div', 'card-art', suit.glyph));
-  card.append(el('div', 'card-text', def.text));
-  if (def.kind === 'minion') card.append(statBadges(def.attack, def.health, false));
-  if (state?.keyNumber) card.append(el('div', 'key-number', String(state.keyNumber)));
-  return card;
-}
-
-/** A minion standing on the board, with live stats and readiness glow. */
-export function minionToken(minion, side, state) {
-  const def = { name: minionName(minion), suit: minionSuit(minion) };
-  const suit = SUITS[def.suit];
-  const token = el('div', `minion suit-${def.suit} side-${side}`);
-  token.dataset.uid = minion.uid;
-  token.style.setProperty('--suit', suit.color);
-  token.style.setProperty('--suit-deep', suit.deep);
-  if (minion.sick) token.classList.add('sick');
-  if (state?.ready) token.classList.add('ready');
-  if (state?.selected) token.classList.add('selected');
-  if (state?.targetable) token.classList.add('targetable');
-  if (state?.summoned) token.classList.add('summoned');
-  token.append(el('div', 'minion-glyph', suit.glyph));
-  token.append(el('div', 'minion-name', def.name));
-  token.append(keywordChips(minion.keywords));
-  token.append(statBadges(minion.attack, minion.health, minion.health < minion.maxHealth));
-  if (minion.sick) token.append(el('div', 'sick-tag', 'waking…'));
-  return token;
-}
-
-// Minion tokens carry only live stats; name and suit come from the definition.
-import { cardById } from './cards.js';
-function minionName(minion) { return cardById(minion.defId).name; }
-function minionSuit(minion) { return cardById(minion.defId).suit; }
-
-/** A hero plate: portrait glyph, name, big life total, deck and hand counts. */
-export function heroPlate(duelist, side, state) {
-  const plate = el('div', `hero-plate side-${side}`);
-  plate.dataset.side = side;
-  if (state?.targetable) plate.classList.add('targetable');
-  if (state?.active) plate.classList.add('active-turn');
-  const face = el('div', 'hero-face', side === 'foe' ? '♜' : '♞');
-  const info = el('div', 'hero-info');
-  info.append(el('div', 'hero-name', duelist.name));
-  const life = el('div', 'hero-life');
-  life.append(el('span', 'life-heart', '♥'));
-  life.append(el('span', 'life-num', String(Math.max(0, duelist.health))));
-  life.append(el('span', 'life-max', `/ ${duelist.maxHealth}`));
-  info.append(life);
-  const meta = el('div', 'hero-meta', `Deck ${duelist.deck.length} · Hand ${duelist.hand.length}`);
-  if (duelist.burnTurns > 0) meta.textContent += ` · BURNING ${duelist.burnAmount}×${duelist.burnTurns}`;
-  info.append(meta);
-  info.append(lifeBar(duelist));
-  plate.append(face, info);
-  return plate;
-}
-
-/** The ember track: filled pips for energy in hand, hollow for the rest. */
-export function emberTrack(duelist) {
-  const track = el('div', 'ember-track');
-  track.append(el('span', 'ember-label', `EMBER ${duelist.ember}/${duelist.emberMax}`));
-  const pips = el('div', 'ember-pips');
-  for (let i = 0; i < duelist.emberMax; i += 1) {
-    pips.append(el('span', `pip${i < duelist.ember ? ' full' : ''}`));
+  head.appendChild(el('span', 'card-cost', String(card.cost)));
+  head.appendChild(el('span', 'card-name', card.name));
+  root.appendChild(head);
+  const art = el('div', 'card-art', suit.glyph);
+  root.appendChild(art);
+  root.appendChild(el('div', 'card-kind', card.kind === 'minion' ? 'MINION' : 'SPELL'));
+  if (card.kind === 'minion') {
+    const stats = el('div', 'card-stats');
+    stats.appendChild(el('span', 'stat-atk', '⚔ ' + card.attack));
+    stats.appendChild(el('span', 'stat-hp', '♥ ' + card.health));
+    root.appendChild(stats);
   }
-  track.append(pips);
-  return track;
+  root.appendChild(el('div', 'card-text', card.text || '—'));
+  if (opts.showFlavour !== false) root.appendChild(el('div', 'card-flavour', card.flavour || ''));
+  root.appendChild(suitBadge(card));
+  if (opts.keyNum) root.appendChild(el('div', 'card-key', String(opts.keyNum)));
+  return root;
 }
 
-/** The Warden's announced plan — the line that makes the opponent readable. */
-export function intentBanner(state) {
-  const banner = el('div', 'intent-banner');
-  banner.append(el('span', 'intent-eye', '👁'));
-  banner.append(el('span', 'intent-text', intent(state)));
-  return banner;
+export function minionEl(minion, opts = {}) {
+  const card = cardById(minion.cardId);
+  const suit = SUITS[card.suit];
+  const root = el('div', 'minion suit-' + card.suit + (minion.canAttack && !minion.attacked ? ' ready' : '') + (opts.selected ? ' selected' : '') + (opts.targetable ? ' targetable' : ''));
+  root.dataset.uid = String(minion.uid);
+  root.appendChild(el('div', 'minion-glyph', suit.glyph));
+  root.appendChild(el('div', 'minion-name', card.name));
+  const stats = el('div', 'minion-stats');
+  stats.appendChild(el('span', 'stat-atk', '⚔' + minion.attack));
+  stats.appendChild(el('span', 'stat-hp' + (minion.health < minion.maxHealth ? ' hurt' : ''), '♥' + minion.health));
+  root.appendChild(stats);
+  if (minion.keywords.length) root.appendChild(el('div', 'minion-kw', minion.keywords.join(' · ')));
+  if (minion.justSummoned) root.appendChild(el('div', 'minion-sick', 'summoning…'));
+  return root;
 }
 
-/** A slim life bar under a hero plate's numbers, for at-a-glance reading. */
-export function lifeBar(duelist) {
+export function heroPlate(side, hero) {
+  const info = HEROES[side];
+  const root = el('div', 'hero-plate hero-' + side);
+  root.dataset.side = side;
+  const left = el('div', 'hero-left');
+  left.appendChild(el('div', 'hero-name', info.name));
+  left.appendChild(el('div', 'hero-title', info.title));
+  root.appendChild(left);
+  const right = el('div', 'hero-right');
+  right.appendChild(el('div', 'hero-life', '♥ ' + hero.life + ' / ' + hero.maxLife));
+  const barWrap = el('div', 'life-bar-wrap');
   const bar = el('div', 'life-bar');
-  const fill = el('div', 'life-fill');
-  const pct = Math.max(0, Math.min(100, (duelist.health / duelist.maxHealth) * 100));
-  fill.style.width = `${pct}%`;
-  if (pct <= 30) fill.classList.add('low');
-  bar.append(fill);
-  return bar;
+  bar.style.width = lifePercent(hero.life, hero.maxLife) + '%';
+  barWrap.appendChild(bar);
+  right.appendChild(barWrap);
+  right.appendChild(el('div', 'hero-meta', 'Deck ' + hero.deck.length + ' · Hand ' + hero.hand.length + (hero.burn ? ' · 🔥 burning' : '')));
+  root.appendChild(right);
+  return root;
 }
 
-/** The last few duel-log lines, newest last. */
-export function duelLog(state) {
-  const log = el('div', 'duel-log');
-  for (const line of state.log.slice(-3)) log.append(el('div', 'log-line', line));
-  return log;
+export function emberPips(hero) {
+  const wrap = el('div', 'ember-pips');
+  wrap.appendChild(el('span', 'ember-label', 'EMBER'));
+  for (let i = 0; i < CONFIG.maxEmber; i++) {
+    wrap.appendChild(el('span', 'pip' + (i < hero.ember ? ' full' : i < hero.maxEmber ? ' spent' : ' locked'), '◆'));
+  }
+  wrap.appendChild(el('span', 'ember-num', hero.ember + ' / ' + hero.maxEmber));
+  return wrap;
 }
 
-/**
- * Rebuild the play table from state. `ui` carries the interaction selection:
- * { selectedCard, selectedAttacker, targetMode, justSummoned:Set, dealt:Set }.
- * Event wiring lives in main.js via data attributes and delegation.
- */
-export function renderTable(root, state, ui) {
-  root.innerHTML = '';
-  const table = el('div', 'table');
-
-  // Foe row: hero plate, foe hand face-up (small), foe ember.
-  const foeRow = el('div', 'row foe-row');
-  foeRow.append(heroPlate(state.foe, 'foe', {
-    targetable: ui.targetMode === 'attack' || ui.targetMode === 'spell',
-    active: state.active === 'foe',
-  }));
-  const foeHand = el('div', 'foe-hand');
-  state.foe.hand.forEach((held) => foeHand.append(cardFace(held, 'mini', {})));
-  if (state.foe.hand.length === 0) foeHand.append(el('div', 'empty-hand', 'no cards'));
-  foeRow.append(foeHand);
-  foeRow.append(emberTrack(state.foe));
-  table.append(foeRow);
-
-  // Foe board.
-  const foeBoard = el('div', 'board foe-board');
-  state.foe.board.forEach((minion) => foeBoard.append(minionToken(minion, 'foe', {
-    targetable: ui.targetMode === 'attack' || ui.targetMode === 'spell',
-    summoned: ui.justSummoned?.has(minion.uid),
-  })));
-  if (state.foe.board.length === 0) foeBoard.append(el('div', 'empty-board', '— the Warden\'s field is empty —'));
-  table.append(foeBoard);
-
-  // Middle strip: turn banner, intent, log.
-  const middle = el('div', 'middle-strip');
-  const turnLabel = state.active === 'player' ? `YOUR TURN · ROUND ${state.turn}` : 'WARDEN\'S TURN';
-  middle.append(el('div', `turn-label ${state.active}`, turnLabel));
-  middle.append(intentBanner(state));
-  middle.append(duelLog(state));
-  table.append(middle);
-
-  // Player board.
-  const playerBoard = el('div', 'board player-board');
-  state.player.board.forEach((minion) => playerBoard.append(minionToken(minion, 'player', {
-    ready: state.active === 'player' && !minion.sick && !minion.attacked,
-    selected: ui.selectedAttacker === minion.uid,
-    targetable: ui.targetMode === 'buff',
-    summoned: ui.justSummoned?.has(minion.uid),
-  })));
-  if (state.player.board.length === 0) playerBoard.append(el('div', 'empty-board', '— play a minion to hold the field —'));
-  table.append(playerBoard);
-
-  // Player row: hero plate, hand fan, ember + End Turn.
-  const playerRow = el('div', 'row player-row');
-  playerRow.append(heroPlate(state.player, 'player', {
-    targetable: ui.targetMode === 'spell',
-    active: state.active === 'player',
-  }));
-  const hand = el('div', 'player-hand');
-  state.player.hand.forEach((held, index) => {
-    const def = defOf(held);
-    hand.append(cardFace(held, 'hand', {
-      selected: ui.selectedCard === held.uid,
-      unaffordable: def.cost > state.player.ember || state.active !== 'player',
-      keyNumber: index + 1,
-      dealt: ui.dealt?.has(held.uid),
-    }));
-  });
-  if (state.player.hand.length === 0) hand.append(el('div', 'empty-hand', 'no cards — end the turn to draw'));
-  playerRow.append(hand);
-  const controls = el('div', 'controls');
-  controls.append(emberTrack(state.player));
-  const endButton = el('button', 'end-turn', 'END TURN ▸');
-  endButton.id = 'end-turn';
-  endButton.disabled = state.active !== 'player' || state.phase !== 'play';
-  controls.append(endButton);
-  controls.append(el('div', 'hint-line', ui.hint || 'Click a card, then a target. Keys 1–7 pick a card, Space ends the turn.'));
-  playerRow.append(controls);
-  table.append(playerRow);
-
-  root.append(table);
-}
-
-/** The title screen: name, tagline, a fan of showcase cards, Play button. */
-export function renderTitle(root, showcase) {
-  root.innerHTML = '';
-  const screen = el('div', 'screen title-screen');
-  screen.append(el('div', 'title-kicker', 'AN ORIGINAL CARD DUEL'));
-  screen.append(el('h1', 'game-title', 'EMBERFALL DUEL'));
-  screen.append(el('div', 'title-tagline', 'Out-think the Ashen Warden. Every card is a decision; every suit a weapon.'));
+export function renderTitle(stage, onStart) {
+  stage.innerHTML = '';
+  const root = el('div', 'screen title-screen');
+  root.appendChild(el('div', 'game-title', 'EMBERFALL DUEL'));
+  root.appendChild(el('div', 'game-tagline', 'Two keepers. Twenty-four cards. One cold ash throne.'));
   const fan = el('div', 'title-fan');
-  showcase.forEach((instance, index) => {
-    const card = cardFace(instance, 'hand', {});
-    card.style.setProperty('--fan', String(index - (showcase.length - 1) / 2));
-    fan.append(card);
+  showcaseCards().forEach((card, i) => {
+    const c = cardEl(card, { showFlavour: true });
+    c.style.transform = `rotate(${(i - 2) * 7}deg) translateY(${Math.abs(i - 2) * 10}px)`;
+    fan.appendChild(c);
   });
-  screen.append(fan);
+  root.appendChild(fan);
   const rules = el('div', 'title-rules');
-  rules.append(el('div', 'rule-line', '♥ 24 life each · 🔥 ember grows every turn · ⚔ minions trade blows · GUARD must be answered'));
-  rules.append(el('div', 'rule-line', '👁 The Warden announces its plan — read it, counter it, burn it down.'));
-  screen.append(rules);
-  const play = el('button', 'play-button', '▶  ENTER THE DUEL');
-  play.id = 'play-button';
-  screen.append(play);
-  screen.append(el('div', 'title-foot', 'Mouse + keyboard · plays offline · no two duels alike'));
-  root.append(screen);
+  rules.appendChild(el('div', '', '⚔ Minions trade damage both ways · GUARD must be attacked first · SWIFT strikes at once'));
+  rules.appendChild(el('div', '', '◆ Ember grows 1 → 8 · Draw 1 a turn · Bring the foe from 24 life to 0'));
+  rules.appendChild(el('div', '', '▲ Flame  ≈ Tide  ❦ Grove  ◆ Void — colour, shape and glyph tell every suit apart'));
+  root.appendChild(rules);
+  const btn = el('button', 'big-btn', 'ENTER THE DUEL');
+  btn.id = 'start-btn';
+  btn.addEventListener('click', onStart);
+  root.appendChild(btn);
+  root.appendChild(el('div', 'title-hint', 'Mouse + keyboard · 1–7 pick a card · Space ends turn · Esc cancels'));
+  stage.appendChild(root);
 }
 
-/** Win and loss screens with the duel's numbers and a Play Again button. */
-export function renderEnd(root, state, best) {
-  root.innerHTML = '';
-  const won = state.winner === 'player';
-  const draw = state.winner === 'draw';
-  const screen = el('div', `screen end-screen ${won ? 'won' : draw ? 'draw' : 'lost'}`);
-  screen.append(el('div', 'end-kicker', draw ? 'MUTUAL RUIN' : won ? 'VICTORY' : 'DEFEAT'));
-  screen.append(el('h1', 'end-title', draw ? 'BOTH FALL' : won ? 'THE WARDEN BURNS' : 'THE ASHES CLAIM YOU'));
-  screen.append(el('div', 'end-line', draw
-    ? 'Two heroes, one pyre. Shuffle up and settle it.'
-    : won
-      ? 'The Ashen Warden crumbles. The ember is yours — this time.'
-      : 'The Warden read you better. Study its intent banner and strike back.'));
+export function renderTable(stage, state, ui, handlers) {
+  stage.innerHTML = '';
+  const root = el('div', 'screen table-screen');
+  // Foe hero + hand (face-up small cards so the judge sees both hands).
+  const foeTop = el('div', 'foe-top');
+  foeTop.appendChild(heroPlate('foe', state.foe));
+  const foeHand = el('div', 'foe-hand');
+  state.foe.hand.forEach((id) => {
+    const c = cardEl(cardById(id), { small: true, showFlavour: false });
+    foeHand.appendChild(c);
+  });
+  if (!state.foe.hand.length) foeHand.appendChild(el('div', 'empty-note', 'No cards in hand'));
+  foeTop.appendChild(foeHand);
+  root.appendChild(foeTop);
+  // Foe board
+  const foeBoard = el('div', 'board board-foe');
+  state.foe.board.forEach((m) => {
+    const me = minionEl(m, { targetable: !!ui.targeting });
+    me.addEventListener('click', () => handlers.onFoeMinion(m.uid));
+    foeBoard.appendChild(me);
+  });
+  if (!state.foe.board.length) foeBoard.appendChild(el('div', 'empty-note', '— empty board —'));
+  root.appendChild(foeBoard);
+  // Middle strip
+  const mid = el('div', 'mid-strip');
+  mid.appendChild(el('div', 'turn-label', state.turn === 'player' ? `ROUND ${state.round} — YOUR TURN` : `ROUND ${state.round} — WARDEN'S TURN`));
+  const intent = foeIntent(state);
+  mid.appendChild(el('div', 'intent-banner intent-' + intent.key, 'Warden intent: ' + intent.text));
+  const logBox = el('div', 'duel-log');
+  state.log.slice(-4).forEach((line) => logBox.appendChild(el('div', 'log-line', line)));
+  mid.appendChild(logBox);
+  root.appendChild(mid);
+  // Player board
+  const pBoard = el('div', 'board board-player');
+  state.player.board.forEach((m) => {
+    const me = minionEl(m, { selected: ui.selectedMinion === m.uid, targetable: !!ui.targetingSpell });
+    me.addEventListener('click', () => handlers.onPlayerMinion(m.uid));
+    pBoard.appendChild(me);
+  });
+  if (!state.player.board.length) pBoard.appendChild(el('div', 'empty-note', '— empty board —'));
+  root.appendChild(pBoard);
+  // Player hero + ember + end turn
+  const pRow = el('div', 'player-row');
+  pRow.appendChild(heroPlate('player', state.player));
+  pRow.appendChild(emberPips(state.player));
+  const endBtn = el('button', 'end-btn', 'END TURN ⏭');
+  endBtn.id = 'end-btn';
+  endBtn.disabled = state.turn !== 'player' || !!state.winner || !!ui.busy;
+  endBtn.addEventListener('click', handlers.onEndTurn);
+  pRow.appendChild(endBtn);
+  root.appendChild(pRow);
+  // Player hand fan
+  const hand = el('div', 'player-hand');
+  state.player.hand.forEach((id, i) => {
+    const card = cardById(id);
+    const c = cardEl(card, { selected: ui.selectedCard === i, disabled: card.cost > state.player.ember || state.turn !== 'player', keyNum: i + 1 });
+    c.style.transform = `rotate(${(i - (state.player.hand.length - 1) / 2) * 3}deg)`;
+    c.addEventListener('click', () => handlers.onHandCard(i));
+    hand.appendChild(c);
+  });
+  if (!state.player.hand.length) hand.appendChild(el('div', 'empty-note', 'No cards — end your turn'));
+  root.appendChild(hand);
+  root.appendChild(el('div', 'hint-line', ui.hint || 'Click a card, then a target · Click a ready minion, then its victim · 1–7 · Space · Esc'));
+  stage.appendChild(root);
+}
+
+export function renderEnd(stage, state, won, onAgain) {
+  stage.innerHTML = '';
+  const root = el('div', 'screen end-screen ' + (won ? 'win-screen' : 'loss-screen'));
+  root.appendChild(el('div', 'end-title', won ? '🏆 VICTORY' : '💀 DEFEAT'));
+  root.appendChild(el('div', 'end-sub', won ? 'The Ashen Warden falls. The ember throne is yours.' : 'The ash takes another keeper. Rise and duel again.'));
   const stats = el('div', 'end-stats');
   const rows = [
-    ['Rounds fought', String(state.turn)],
-    ['Damage dealt', String(state.player.damageDealt)],
-    ['Cards played', String(state.player.cardsPlayed)],
-    ['Your life left', `${Math.max(0, state.player.health)} / ${state.player.maxHealth}`],
-    ['Warden life left', `${Math.max(0, state.foe.health)} / ${state.foe.maxHealth}`],
+    ['Rounds played', String(state.round)],
+    ['Damage you dealt', String(state.stats.playerDamage)],
+    ['Damage you took', String(state.stats.foeDamage)],
+    ['Cards you played', String(state.stats.playerPlayed)],
+    ['Cards Warden played', String(state.stats.foePlayed)],
+    ['Your life left', state.player.life + ' / ' + state.player.maxLife],
+    ['Warden life left', state.foe.life + ' / ' + state.foe.maxLife],
   ];
-  if (best) rows.push(['Best result', best]);
-  for (const [label, value] of rows) {
+  rows.forEach(([k, v]) => {
     const row = el('div', 'stat-row');
-    row.append(el('span', 'stat-label', label));
-    row.append(el('span', 'stat-value', value));
-    stats.append(row);
-  }
-  screen.append(stats);
-  const again = el('button', 'play-button', '↻  DUEL AGAIN');
-  again.id = 'play-button';
-  screen.append(again);
-  root.append(screen);
+    row.appendChild(el('span', 'stat-k', k));
+    row.appendChild(el('span', 'stat-v', v));
+    stats.appendChild(row);
+  });
+  root.appendChild(stats);
+  const btn = el('button', 'big-btn', 'DUEL AGAIN');
+  btn.id = 'again-btn';
+  btn.addEventListener('click', onAgain);
+  root.appendChild(btn);
+  stage.appendChild(root);
 }
